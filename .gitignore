@@ -1,0 +1,8 @@
+**/__pycache__
+**/.mypy_cache
+**/.pytest_cache
+**/.coverage
+**/.DS_Store
+
+.env
+wandb
