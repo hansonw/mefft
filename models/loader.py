@@ -2,15 +2,14 @@ import torch
 from transformers import AutoTokenizer
 from trl import DataCollatorForCompletionOnlyLM
 
-from .cohere import CohereForCausalLM
-from .mistral import MistralForCausalLM
-
 
 def load_model(model_name: str):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.padding_side = "right"  # for better numerical stability
 
     if model_name.startswith("Cohere"):
+        from .cohere import CohereForCausalLM
+
         model = CohereForCausalLM.from_pretrained(
             model_name, torch_dtype=torch.bfloat16, device_map="auto"
         )
@@ -21,6 +20,8 @@ def load_model(model_name: str):
 
         response_template = "<|CHATBOT_TOKEN|>"
     elif model_name.startswith("mistralai"):
+        from .mistral import MistralForCausalLM
+
         model = MistralForCausalLM.from_pretrained(
             model_name, torch_dtype=torch.bfloat16, device_map="auto"
         )

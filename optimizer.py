@@ -1,16 +1,17 @@
-from typing import Iterable, Type
-
+# pyright: reportMissingImports=false
 import torch
-from torch.optim.optimizer import Optimizer
-from bitsandbytes.optim import PagedAdamW8bit
-from numba.cuda import current_context
-from numba.cuda.cudadrv import devicearray, driver
-from numba.cuda.api_util import prepare_shape_strides_dtype
 import numpy as np
-import torch
+from torch.optim.optimizer import Optimizer
+from typing import Any, Iterable, Type
+
+try:
+    # To enable running on Modal
+    from bitsandbytes.optim import PagedAdamW8bit
+except ImportError:
+    PagedAdamW8bit: Any = object
+
 
 dtype_map: dict[torch.dtype, np.dtype] = {
-    torch.bfloat16: np.dtype("float16"),
     torch.float16: np.dtype("float16"),
     torch.float32: np.dtype("float32"),
     torch.long: np.dtype("int64"),
@@ -19,7 +20,21 @@ dtype_map: dict[torch.dtype, np.dtype] = {
 }
 
 
-def mapped_tensor(shape: tuple[int, ...], dtype: torch.dtype):
+def mapped_tensor(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """
+    A hacky approach for allocating mapped CUDA memory (lives on CPU, but accessible on GPU)
+    and then creating a PyTorch tensor from it.
+
+    This could be streamlined with C code that calls cudaHostAlloc and then torch::from_blob.
+    """
+    from numba.cuda import current_context
+    from numba.cuda.cudadrv import devicearray, driver
+    from numba.cuda.api_util import prepare_shape_strides_dtype
+
+    if dtype == torch.bfloat16:
+        # bfloat16 is not supported by numpy, so allocate float16 and reinterpret it
+        return mapped_tensor(shape, torch.float16).view(dtype=torch.bfloat16)
+
     np_dtype = dtype_map[dtype]
     shape, strides, _ = prepare_shape_strides_dtype(
         shape, strides=None, dtype=np_dtype, order="C"
@@ -33,11 +48,16 @@ def mapped_tensor(shape: tuple[int, ...], dtype: torch.dtype):
 
 
 class MappedAdamW8bit(PagedAdamW8bit):
+    """
+    Modification to PagedAdamW8bit that uses mapped memory instead of page memory.
+    The paged memory implementation triggers a lot of CUDA synchronizations/page faults.
+    """
+
     @torch.no_grad()
     def step(self, closure=None):
         """
         Same as the parent implementation, but **without prefetch/synchronize calls**.
-        We will do this globally in `InterleavedOptimizer.step`
+        It's not needed for mapped memory.
         """
         loss = None
         if closure is not None:
@@ -58,11 +78,25 @@ class MappedAdamW8bit(PagedAdamW8bit):
     def get_state_buffer(self, p, dtype=torch.float32):
         return mapped_tensor(p.shape, dtype)
 
+    def zero_grad(self, set_to_none=True):
+        # Force set_to_none=False to avoid clearing mapped gradients
+        super().zero_grad(set_to_none=False)
+
+
+def initialize_mapped_gradients(model: torch.nn.Module):
+    """
+    Offloads all model gradients to CPU as mapped tensors.
+    Accumulated gradients will be transparently saved back to CPU.
+    """
+    for p in model.parameters():
+        if p.requires_grad:
+            p.grad = mapped_tensor(p.shape, p.dtype)
+
 
 class InterleavedOptimizer(Optimizer):
     """
     PyTorch optimizer that interleaves step() with the backward pass.
-    IMPORTANT: Not compatible with gradient accumulation (yet).
+    IMPORTANT: Not compatible with gradient accumulation.
     """
 
     def __init__(

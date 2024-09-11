@@ -37,7 +37,7 @@ app_image = (
 app = modal.App(
     "mefft",
     image=app_image,
-    # Should contain HF_TOKEN and WANDB_API_TOKEN; optionally WANDB_PROJECT
+    # Should contain HF_TOKEN and WANDB_API_KEY; optionally WANDB_PROJECT
     secrets=[modal.Secret.from_dotenv()],
     volumes={
         "/pretrained": modal.Volume.from_name("pretrained-vol"),
@@ -55,6 +55,8 @@ async def main(
     resume: bool = False,
     max_seq_length: int = 20000,
     learning_rate: float = 5e-6,
+    micro_batch_size: int = 8,
+    gradient_accumulation_steps: int = 1,
 ):
     assert train.callback
     train.callback(
@@ -66,4 +68,6 @@ async def main(
         resume=resume,
         max_seq_length=max_seq_length,
         learning_rate=learning_rate,
+        micro_batch_size=micro_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
     )

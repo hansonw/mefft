@@ -1,7 +1,7 @@
 from datasets import load_dataset, Dataset
 from trl import SFTConfig, SFTTrainer
 from models.loader import load_model
-from optimizer import InterleavedOptimizer, MappedAdamW8bit
+from optimizer import InterleavedOptimizer, MappedAdamW8bit, initialize_mapped_gradients
 import click
 
 
@@ -14,6 +14,12 @@ import click
 @click.option("--resume", is_flag=True, help="Resume training from the last checkpoint")
 @click.option("--max-seq-length", default=20000, help="Maximum sequence length")
 @click.option("--learning-rate", default=5e-6, help="Learning rate")
+@click.option("--micro-batch-size", default=8, help="Batch size per forward pass")
+@click.option(
+    "--gradient-accumulation-steps",
+    default=1,
+    help="Number of gradient accumulation steps",
+)
 def train(
     model_name: str,
     train_path: str,
@@ -23,21 +29,30 @@ def train(
     resume: bool,
     max_seq_length: int,
     learning_rate: float,
+    micro_batch_size: int,
+    gradient_accumulation_steps: int,
 ):
     print("Loading datasets...")
     train_data = load_dataset("json", data_files=train_path, split="train")
     assert isinstance(train_data, Dataset)
     eval_data = load_dataset(
         "json", data_files=eval_path, split="train", keep_in_memory=True
-    ).sort(  # type: ignore - sort by token length for batching efficiency
-        "tokens"
-    )
+    ).sort("tokens")  # type: ignore
 
     print(f"Loading model {model_name}...")
     model, tokenizer, collator = load_model(model_name)
-    optimizer = InterleavedOptimizer(
-        model.parameters(), MappedAdamW8bit, lr=learning_rate
-    )
+
+    if gradient_accumulation_steps > 1:
+        print("Initializing offloaded gradients and optimizer...")
+        initialize_mapped_gradients(model)
+        optimizer = MappedAdamW8bit(model.parameters(), lr=learning_rate)
+        # Make sure the mapped gradients do not get cleared!
+        original_zero_grad = model.zero_grad
+        model.zero_grad = lambda set_to_none=False: original_zero_grad(False)
+    else:
+        optimizer = InterleavedOptimizer(
+            model.parameters(), MappedAdamW8bit, lr=learning_rate
+        )
 
     trainer = SFTTrainer(
         model=model,
@@ -56,7 +71,8 @@ def train(
             lr_scheduler_type="cosine_with_min_lr",
             lr_scheduler_kwargs={"min_lr_rate": 0.01},
             neftune_noise_alpha=5,
-            per_device_train_batch_size=3,
+            per_device_train_batch_size=micro_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_steps=50,
             seed=42,
             # evaluation
@@ -65,7 +81,7 @@ def train(
             eval_steps=0.2,
             eval_on_start=False,
             # saving/logging
-            logging_steps=5,
+            logging_steps=1,
             run_name=run_name,
             output_dir=output_dir,
             save_strategy="steps",
