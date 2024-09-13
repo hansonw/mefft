@@ -1,8 +1,10 @@
-from datasets import load_dataset, Dataset
+import click
+from datasets import Dataset, load_dataset
+from transformers.trainer_utils import get_last_checkpoint
 from trl import SFTConfig, SFTTrainer
+
 from models.loader import load_model
 from optimizer import InterleavedOptimizer, MappedAdamW8bit, initialize_mapped_gradients
-import click
 
 
 @click.command()
@@ -11,7 +13,12 @@ import click
 @click.option("--eval-path", required=True, help="Path to the evaluation data file")
 @click.option("--run-name", required=True, help="Name of the training run")
 @click.option("--output-dir", required=True, help="Directory to save the output")
-@click.option("--resume", is_flag=True, help="Resume training from the last checkpoint")
+@click.option(
+    "--resume",
+    is_flag=True,
+    default=True,
+    help="Resume from the last checkpoint, if available",
+)
 @click.option("--max-seq-length", default=20000, help="Maximum sequence length")
 @click.option("--learning-rate", default=5e-6, help="Learning rate")
 @click.option("--micro-batch-size", default=8, help="Batch size per forward pass")
@@ -40,7 +47,7 @@ def train(
     ).sort("tokens")  # type: ignore
 
     print(f"Loading model {model_name}...")
-    model, tokenizer, collator = load_model(model_name)
+    model, tokenizer, collator = load_model(model_name, max_seq_length)
 
     if gradient_accumulation_steps > 1:
         print("Initializing offloaded gradients and optimizer...")
@@ -68,12 +75,11 @@ def train(
             num_train_epochs=1.0,
             group_by_length=True,
             learning_rate=learning_rate,
-            lr_scheduler_type="cosine_with_min_lr",
-            lr_scheduler_kwargs={"min_lr_rate": 0.01},
+            lr_scheduler_type="cosine",
             neftune_noise_alpha=5,
             per_device_train_batch_size=micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_steps=50,
+            warmup_ratio=0.05,
             seed=42,
             # evaluation
             per_device_eval_batch_size=8,
@@ -86,12 +92,13 @@ def train(
             output_dir=output_dir,
             save_strategy="steps",
             save_steps=0.25,
-            report_to="wandb",
         ),
     )
 
     print("Starting training...")
-    trainer.train(resume_from_checkpoint=resume)  # type: ignore
+    trainer.train(
+        resume_from_checkpoint=resume and get_last_checkpoint(output_dir) is not None
+    )  # type: ignore
     print(trainer.evaluate())
 
 

@@ -1,4 +1,6 @@
 # pyright: reportMissingImports=false
+from collections import abc, defaultdict
+from itertools import chain
 import torch
 import numpy as np
 from torch.optim.optimizer import Optimizer
@@ -77,6 +79,80 @@ class MappedAdamW8bit(PagedAdamW8bit):
 
     def get_state_buffer(self, p, dtype=torch.float32):
         return mapped_tensor(p.shape, dtype)
+
+    def load_state_dict(self, state_dict):
+        """
+        This is generally just copied from the base implementation, except that it doesn't
+        correctly load state into mapped memory (TODO: upstream START CHANGE -> END CHANGE)
+        """
+
+        # Validate the state_dict
+        groups = self.param_groups
+        saved_groups = state_dict["param_groups"]
+
+        if len(groups) != len(saved_groups):
+            raise ValueError(
+                "loaded state dict has a different number of parameter groups"
+            )
+        param_lens = (len(g["params"]) for g in groups)
+        saved_lens = (len(g["params"]) for g in saved_groups)
+        if any(p_len != s_len for p_len, s_len in zip(param_lens, saved_lens)):
+            raise ValueError(
+                "loaded state dict contains a parameter group that doesn't match the size of optimizer's group",
+            )
+
+        # Update the state
+        id_map = {
+            old_id: p
+            for old_id, p in zip(
+                chain.from_iterable(g["params"] for g in saved_groups),
+                chain.from_iterable(g["params"] for g in groups),
+            )
+        }
+
+        def cast(param, value):
+            r"""Make a deep copy of value, casting all tensors to device of param."""
+            if isinstance(value, torch.Tensor):
+                # Floating-point types are a bit special here. They are the only ones
+                # that are assumed to always match the type of params.
+                if param.is_floating_point() and value.dtype != torch.uint8:
+                    value = value.to(param.dtype)
+                return value
+            elif isinstance(value, dict):
+                for k, v in value.items():
+                    if k in self.non_castable_tensor_keys:
+                        # START CHANGE: make sure the tensor gets loaded into mapped memory
+                        buffer = self.get_state_buffer(v, v.dtype)
+                        buffer.copy_(v)
+                        value[k] = buffer
+                        # END CHANGE
+                    else:
+                        value[k] = cast(param, v)
+
+                return value
+            elif isinstance(value, abc.Iterable):
+                return type(value)(cast(param, v) for v in value)  # type: ignore
+            else:
+                return value
+
+        # Copy state assigned to params (and cast tensors to appropriate types).
+        # State that is not assigned to params is copied as is (needed for
+        # backward compatibility).
+        state = defaultdict(dict)
+        for k, v in state_dict["state"].items():
+            if k in id_map:
+                param = id_map[k]
+                state[param] = cast(param, v)  # type: ignore
+            else:
+                state[k] = v
+
+        # Update parameter groups, setting their 'params' value
+        def update_group(group, new_group):
+            new_group["params"] = group["params"]
+            return new_group
+
+        param_groups = [update_group(g, ng) for g, ng in zip(groups, saved_groups)]
+        self.__setstate__({"state": self.state, "param_groups": param_groups})
 
     def zero_grad(self, set_to_none=True):
         # Force set_to_none=False to avoid clearing mapped gradients

@@ -8,6 +8,7 @@ from transformers import MistralConfig
 from transformers.models.mistral.modeling_mistral import MistralRotaryEmbedding, MistralForCausalLM as OriginalMistralForCausalLM, MistralPreTrainedModel
 
 from .kernels import FusedLinearCrossEntropyFunction
+from .offload_checkpointer import OffloadCheckpointer
 
 
 class Attention(nn.Module):
@@ -75,57 +76,6 @@ class Attention(nn.Module):
         return self.o_proj(attn_output)
 
 
-class CheckpointedDecoder(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        x: torch.Tensor,
-        attention_mask,
-        position_ids,
-        self_attn,
-        mlp,
-        input_layernorm,
-        post_attention_layernorm,
-    ) -> torch.Tensor:
-        # Save the input tensor to CPU (pinned memory)
-        if x.requires_grad:
-            saved_x = torch.empty(x.size(), dtype=x.dtype, layout=x.layout, pin_memory=True)
-            saved_x.copy_(x, non_blocking=True)
-            ctx.save_for_backward(saved_x)
-
-        # Forward pass
-        with torch.no_grad():
-            output = x + self_attn(input_layernorm(x), attention_mask, position_ids)
-            output = output + mlp(post_attention_layernorm(output))
-
-        ctx.args = (attention_mask, position_ids, self_attn, mlp, input_layernorm, post_attention_layernorm)
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        if len(ctx.saved_tensors) == 0:
-            return (None,) * (1 + len(ctx.args))
-
-        attention_mask, position_ids, self_attn, mlp, input_layernorm, post_attention_layernorm = ctx.args
-
-        x: torch.Tensor = ctx.saved_tensors[0]
-        x = x.cuda(non_blocking=True).detach()
-        x.requires_grad = True
-
-        with torch.enable_grad():
-            # Forward pass (again)
-            # TODO: if we save the output post-attention, maybe we could do
-            # output2 = output1 + mlp
-            # backward(output2, dY)
-            # output1 = x + self_attn (can happen in parallel with backward?)
-            # backward(output1, output2.grad)
-            output = x + self_attn(input_layernorm(x), attention_mask, position_ids)
-            output = output + mlp(post_attention_layernorm(output))
-
-        torch.autograd.backward(output, grad_output)
-        return (x.grad,) + (None,) * (len(ctx.args))
-
-
 class DecoderLayer(nn.Module):
     def __init__(self, config: MistralConfig):
         super().__init__()
@@ -142,16 +92,8 @@ class DecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ):
-        # The intermediate actions inside the decoder are huge!
-        return CheckpointedDecoder.apply(
-            x,
-            attention_mask,
-            position_ids,
-            self.self_attn,
-            self.mlp,
-            self.input_layernorm,
-            self.post_attention_layernorm,
-        )
+        output = x + self.self_attn(self.input_layernorm(x), attention_mask, position_ids)
+        return output + self.mlp(self.post_attention_layernorm(output))
 
 
 class MistralModel(nn.Module):
@@ -175,7 +117,12 @@ class MistralModel(nn.Module):
 
         hidden_states = self.embed_tokens(input_ids)
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(hidden_states, attention_mask, position_ids)
+            hidden_states = OffloadCheckpointer.apply(
+                hidden_states,
+                decoder_layer,
+                attention_mask,
+                position_ids,
+            )
         return self.norm(hidden_states)
 
 

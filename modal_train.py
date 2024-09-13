@@ -1,4 +1,5 @@
 import modal
+
 from train import train
 
 app_image = (
@@ -52,7 +53,7 @@ async def main(
     train_path: str,
     eval_path: str,
     run_name: str,
-    resume: bool = False,
+    resume: bool = True,
     max_seq_length: int = 20000,
     learning_rate: float = 5e-6,
     micro_batch_size: int = 8,

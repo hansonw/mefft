@@ -140,7 +140,7 @@ def liger_cross_entropy_kernel(
 
 
 def fused_linear_cross_entropy_forward(
-    _input, weight, target, bias=None, ignore_index=-100
+    _input, weight, target, bias=None, ignore_index=-100, softcap=0.0
 ):
     device = _input.device
 
@@ -178,6 +178,10 @@ def fused_linear_cross_entropy_forward(
         torch.matmul(_input_chunk, weight.t(), out=logits_chunk)
         if bias is not None:
             logits_chunk += bias
+        if softcap > 0:
+            # TODO: Fuse this into the triton kernel. Note it's not really the bottleneck
+            tanh_chunk = torch.tanh(logits_chunk / softcap)
+            logits_chunk = tanh_chunk * softcap
         target_chunk = target[start_idx:end_idx].contiguous()  # chunk_size,
 
         n_rows = logits_chunk.shape[0]
@@ -201,6 +205,10 @@ def fused_linear_cross_entropy_forward(
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=32,
         )
+
+        if softcap > 0:
+            # d/dx t * tanh(x/t) = 1 - tanh(x/t)^2
+            logits_chunk *= 1 - tanh_chunk.pow(2)
 
         # gradient of logits_chunk is computed in-place by the above triton kernel and is of shape: chunk_size x V
         # thus grad_input[start_idx: end_idx] should be of shape: chunk_size x H
@@ -241,7 +249,7 @@ def fused_linear_cross_entropy_forward(
 
 class FusedLinearCrossEntropyFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, _input, weight, target, bias=None, ignore_index=-100):
+    def forward(ctx, _input, weight, target, bias=None, ignore_index=-100, softcap=0.0):
         """
         Fusing the last linear layer with cross-entropy loss
             Reference: https://github.com/mgmalek/efficient_cross_entropy
@@ -258,7 +266,7 @@ class FusedLinearCrossEntropyFunction(torch.autograd.Function):
         ignore_index: the index to ignore in the target
         """
         loss, grad_input, grad_weight, grad_bias = fused_linear_cross_entropy_forward(
-            _input, weight, target, bias, ignore_index
+            _input, weight, target, bias, ignore_index, softcap
         )
         # downcast to dtype and store for backward
         ctx.save_for_backward(
@@ -275,4 +283,4 @@ class FusedLinearCrossEntropyFunction(torch.autograd.Function):
         # grad_input, grad_weight, grad_bias = fused_linear_cross_entropy_backward(
         #     grad_output, grad_input, grad_weight, grad_bias
         # )
-        return (grad_input, grad_weight, None, grad_bias, None)
+        return (grad_input, grad_weight, None, grad_bias, None, None)

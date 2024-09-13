@@ -43,6 +43,10 @@ class CohereCheckpointedDecoder(torch.autograd.Function):
         (attention_mask, position_ids, input_layernorm, self_attn, mlp) = ctx.args
 
         # Backward pass
+        # NOTE: this is more memory-efficient than the generic checkpointing implementation
+        # because Cohere's decoder implementation allows gradients to flow independently.
+        # Thus we can run backward() against (residual, attn, mlp) separately to avoid keeping
+        # activations around for all three channels.
         x.grad = grad_output.detach()  # residual grad pass-through
         with torch.enable_grad():
             # Do backprop for self-attn/mlp separately to reduce peak memory -
