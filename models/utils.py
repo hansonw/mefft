@@ -21,8 +21,9 @@ class OffloadCheckpointer(torch.autograd.Function):
                 layout=x.layout,
                 pin_memory=not os.environ.get("DISABLE_CHECKPOINT_MEMORY_PINNING"),
             )
-            with torch.cuda.stream(OffloadCheckpointer.stream):
-                saved_x.copy_(x, non_blocking=True)
+            # TODO: this causes numerical stability issues?
+            # with torch.cuda.stream(OffloadCheckpointer.stream):
+            saved_x.copy_(x, non_blocking=True)
             ctx.save_for_backward(saved_x)
 
         # Forward pass
@@ -39,7 +40,7 @@ class OffloadCheckpointer(torch.autograd.Function):
             return (None, None) + (None,) * len(ctx.args)
 
         x: torch.Tensor = ctx.saved_tensors[0]
-        OffloadCheckpointer.stream.synchronize()
+        # OffloadCheckpointer.stream.synchronize()
         x = x.cuda(non_blocking=True).detach()
         x.requires_grad = True
 

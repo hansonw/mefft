@@ -10,9 +10,7 @@ def load_model(model_name: str, max_seq_length: int):
     if model_name.startswith("mistralai"):
         from .mistral import MistralForCausalLM
 
-        model = MistralForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16, device_map="auto"
-        )
+        model = MistralForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, device_map="auto")
 
         if tokenizer.pad_token is None:
             print("NOTICE: Setting Mistral pad_token to <unk>")
@@ -21,9 +19,7 @@ def load_model(model_name: str, max_seq_length: int):
         if isinstance(tokenizer.chat_template, str):
             # Patch a bug with the Mistral tokenizer + system prompts
             print("NOTICE: Patching Mistral tokenizer system prompts")
-            tokenizer.chat_template = tokenizer.chat_template.replace(
-                "loop.last", "loop.first"
-            )
+            tokenizer.chat_template = tokenizer.chat_template.replace("loop.last", "loop.first")
 
         response_template = "[/INST]"
     elif "gemma-2" in model_name:
@@ -69,6 +65,12 @@ def load_model(model_name: str, max_seq_length: int):
 {%- if add_generation_prompt %}{{'<start_of_turn>model\n'}}{%- endif %}"""
 
         response_template = "<start_of_turn>model\n"
+    elif "Qwen2" in model_name:
+        from .qwen2 import Qwen2ForCausalLM
+
+        model = Qwen2ForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, device_map="auto")
+
+        response_template = "<|im_start|>assistant\n"
     else:
         raise ValueError(f"Model {model_name} not supported")
 

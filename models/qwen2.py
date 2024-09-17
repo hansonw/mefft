@@ -2,41 +2,21 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from liger_kernel.transformers.geglu import LigerGEGLUMLP
-from liger_kernel.transformers.rope import liger_rotary_pos_emb
+from liger_kernel.transformers import LigerSwiGLUMLP, LigerRMSNorm, liger_rotary_pos_emb
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
-from transformers.models.gemma2.modeling_gemma2 import (
-    Gemma2Attention as OriginalGemma2Attention,
-    Gemma2Config,
-    Gemma2ForCausalLM as OriginalGemma2ForCausalLM,
-    Gemma2PreTrainedModel,
+from transformers.models.qwen2.modeling_qwen2 import (
+    Qwen2Attention as OriginalQwen2Attention,
+    Qwen2Config,
+    Qwen2ForCausalLM as OriginalQwen2ForCausalLM,
+    Qwen2PreTrainedModel,
 )
 
 from .kernels import FusedLinearCrossEntropyFunction
 from .utils import OffloadCheckpointer
 
 
-# NOTE: LigerRMSNorm is not 100% faithful / numerically stable.
-# torch.compile still allocates a float32 buffer but is more precise
-@torch.compile(dynamic=True)
-def compiled_rms_norm(x, weight, eps):
-    dtype = x.dtype
-    x = x.float()
-    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * (1.0 + weight.float())
-    return x.to(dtype)
-
-
-class Gemma2RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
-
-    def forward(self, x):
-        return compiled_rms_norm(x, self.weight, self.eps)
-
-
-class Gemma2Attention(OriginalGemma2Attention):
+# Same as OriginalQwen2Attention, but simplify and use liger_rotary_pos_emb
+class Qwen2Attention(OriginalQwen2Attention):
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -70,6 +50,15 @@ class Gemma2Attention(OriginalGemma2Attention):
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
 
+        if (
+            self.config.use_sliding_window
+            and getattr(self.config, "sliding_window", None) is not None
+            and self.layer_idx >= self.config.max_window_layers
+        ):
+            sliding_window = self.config.sliding_window
+        else:
+            sliding_window = None
+
         attn_output = _flash_attention_forward(
             query_states,
             key_states,
@@ -78,23 +67,20 @@ class Gemma2Attention(OriginalGemma2Attention):
             q_len,
             softmax_scale=self.scaling,
             is_causal=True,
-            sliding_window=self.sliding_window,
-            softcap=self.config.attn_logit_softcapping,
+            sliding_window=sliding_window,
         )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         return self.o_proj(attn_output)
 
 
-class Gemma2DecoderLayer(nn.Module):
-    def __init__(self, config: Gemma2Config, layer_idx: int):
+class Qwen2DecoderLayer(nn.Module):
+    def __init__(self, config: Qwen2Config, layer_idx: int):
         super().__init__()
-        self.self_attn = Gemma2Attention(config=config, layer_idx=layer_idx)
-        self.mlp = LigerGEGLUMLP(config)
-        self.input_layernorm = Gemma2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Gemma2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_feedforward_layernorm = Gemma2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = Gemma2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = Qwen2Attention(config=config, layer_idx=layer_idx)
+        self.mlp = LigerSwiGLUMLP(config)
+        self.input_layernorm = LigerRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LigerRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def _self_attn(
         self,
@@ -102,10 +88,10 @@ class Gemma2DecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
-        return x + self.post_attention_layernorm(self.self_attn(self.input_layernorm(x), attention_mask, position_ids))
+        return x + self.self_attn(self.input_layernorm(x), attention_mask, position_ids)
 
     def _mlp(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.post_feedforward_layernorm(self.mlp(self.pre_feedforward_layernorm(x)))
+        return x + self.mlp(self.post_attention_layernorm(x))
 
     def forward(
         self,
@@ -117,15 +103,15 @@ class Gemma2DecoderLayer(nn.Module):
         return OffloadCheckpointer.apply(hidden_states, self._mlp)
 
 
-class Gemma2Model(nn.Module):
-    def __init__(self, config: Gemma2Config):
+class Qwen2Model(nn.Module):
+    def __init__(self, config: Qwen2Config):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.layers = nn.ModuleList(
-            [Gemma2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Gemma2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = LigerRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -136,19 +122,15 @@ class Gemma2Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         if position_ids is None:
             position_ids = torch.arange(0, hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
-        # Gemma2 downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
-        # See https://github.com/huggingface/transformers/pull/29402
-        normalizer = torch.tensor(self.hidden_size**0.5, dtype=hidden_states.dtype)
-        hidden_states = hidden_states * normalizer
         for decoder_layer in self.layers:
             hidden_states = decoder_layer(hidden_states, attention_mask, position_ids)
         return self.norm(hidden_states)
 
 
-class Gemma2ForCausalLM(OriginalGemma2ForCausalLM):
-    def __init__(self, config: Gemma2Config):
-        super(Gemma2PreTrainedModel, self).__init__(config)
-        self.model = Gemma2Model(config)
+class Qwen2ForCausalLM(OriginalQwen2ForCausalLM):
+    def __init__(self, config: Qwen2Config):
+        super(Qwen2PreTrainedModel, self).__init__(config)
+        self.model = Qwen2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -167,7 +149,6 @@ class Gemma2ForCausalLM(OriginalGemma2ForCausalLM):
             attention_mask=attention_mask,
             position_ids=position_ids,
         )
-
         if labels is not None:
             # Each hidden state is for the *next* label, so shift labels right
             shift_hidden_states = hidden_states[..., :-1, :].contiguous().view(-1, self.config.hidden_size)
@@ -176,13 +157,8 @@ class Gemma2ForCausalLM(OriginalGemma2ForCausalLM):
                 shift_hidden_states,
                 self.lm_head.weight,
                 shift_labels,
-                None,  # bias
-                -100,  # ignore_index
-                self.config.final_logit_softcapping,
             )
             # Logits are not needed for training/evaluation
             return (loss, None)  # type: ignore
         else:
-            logits = self.lm_head(hidden_states)
-            logits = self.config.final_logit_softcapping * torch.tanh(logits / self.config.final_logit_softcapping)
-            return (logits,)
+            return (self.lm_head(hidden_states),)

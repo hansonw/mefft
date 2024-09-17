@@ -68,9 +68,7 @@ def liger_cross_entropy_kernel(
     m = float("-inf")  # m is the max value. use the notation from the paper
     d = 0.0  # d is the sum. use the notation from the paper
     y = tl.load(Y_ptr)
-    ori_X_y = tl.load(X_ptr + y).cast(
-        tl.float32
-    )  # we need to store the original value of X_y for the loss calculation
+    ori_X_y = tl.load(X_ptr + y).cast(tl.float32)  # we need to store the original value of X_y for the loss calculation
 
     # Label smoothing is a general case of normal cross entropy
     # See the full derivation at https://github.com/linkedin/Liger-Kernel/pull/198#issue-2503665310
@@ -79,9 +77,7 @@ def liger_cross_entropy_kernel(
 
     for i in range(0, n_cols, BLOCK_SIZE):
         X_offsets = i + tl.arange(0, BLOCK_SIZE)
-        X_block = tl.load(
-            X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf")
-        ).cast(tl.float32)
+        X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf")).cast(tl.float32)
         block_max = tl.max(X_block)
         if label_smoothing > 0:
             # scale X beforehand to avoid overflow
@@ -101,9 +97,7 @@ def liger_cross_entropy_kernel(
     n_non_ignore = tl.load(n_non_ignore_ptr)
     for i in range(0, n_cols, BLOCK_SIZE):
         X_offsets = i + tl.arange(0, BLOCK_SIZE)
-        X_block = tl.load(
-            X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf")
-        ).cast(tl.float32)
+        X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf")).cast(tl.float32)
         X_block = (tl.exp(X_block - m) / d - eps) / (n_non_ignore)
         tl.store(X_ptr + X_offsets, X_block, mask=X_offsets < n_cols)
 
@@ -139,9 +133,7 @@ def liger_cross_entropy_kernel(
     tl.store(X_ptr + y, X_y)
 
 
-def fused_linear_cross_entropy_forward(
-    _input, weight, target, bias=None, ignore_index=-100, softcap=0.0
-):
+def fused_linear_cross_entropy_forward(_input, weight, target, bias=None, ignore_index=-100, softcap=0.0):
     device = _input.device
 
     # inputs have shape: BT x H
@@ -156,9 +148,7 @@ def fused_linear_cross_entropy_forward(
     chunk_size = 64 * triton.cdiv(536_870_912 // V, 64)
     num_chunks = triton.cdiv(BT, chunk_size)  # (BT + chunk_size - 1) // chunk_size
 
-    grad_weight = (
-        torch.zeros_like(weight, device=device) if weight.requires_grad else None
-    )
+    grad_weight = torch.zeros_like(weight, device=device) if weight.requires_grad else None
     grad_input = torch.zeros_like(_input, device=device)
     grad_bias = torch.zeros_like(bias, device=device) if bias is not None else None
     # we use fp32 for loss accumulator
