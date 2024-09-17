@@ -15,7 +15,6 @@ app_image = (
         "datasets",
         "hf-transfer",
         "huggingface_hub",
-        "liger-kernel",
         "numba",
         "peft",
         "sentencepiece",
@@ -27,6 +26,7 @@ app_image = (
         "wheel",
     )
     .run_commands("pip install flash-attn --no-build-isolation")
+    .run_commands("pip install git+https://github.com/hansonw/Liger-Kernel.git")
     .env(
         dict(
             HUGGINGFACE_HUB_CACHE="/pretrained",

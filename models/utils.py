@@ -8,6 +8,9 @@ class OffloadCheckpointer(torch.autograd.Function):
     Note that the backward pass will run the full forward pass again.
     """
 
+    # Use a separate stream for offloading copies
+    stream = torch.cuda.Stream()
+
     @staticmethod
     def forward(ctx, x: torch.Tensor, module: torch.nn.Module, *args) -> torch.Tensor:
         # Save the input tensor to CPU (pinned memory)
@@ -16,11 +19,10 @@ class OffloadCheckpointer(torch.autograd.Function):
                 x.size(),
                 dtype=x.dtype,
                 layout=x.layout,
-                # NOTE: Can sometimes cause CUDA invalid memory access errors if checkpoints get too large
-                # (e.g. if batch_size * max_model_len * hidden_size * num_layers is > 50% RAM)
                 pin_memory=not os.environ.get("DISABLE_CHECKPOINT_MEMORY_PINNING"),
             )
-            saved_x.copy_(x, non_blocking=True)
+            with torch.cuda.stream(OffloadCheckpointer.stream):
+                saved_x.copy_(x, non_blocking=True)
             ctx.save_for_backward(saved_x)
 
         # Forward pass
@@ -37,6 +39,7 @@ class OffloadCheckpointer(torch.autograd.Function):
             return (None, None) + (None,) * len(ctx.args)
 
         x: torch.Tensor = ctx.saved_tensors[0]
+        OffloadCheckpointer.stream.synchronize()
         x = x.cuda(non_blocking=True).detach()
         x.requires_grad = True
 

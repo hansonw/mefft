@@ -7,15 +7,7 @@ def load_model(model_name: str, max_seq_length: int):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.padding_side = "right"  # for better numerical stability
 
-    if model_name.startswith("Cohere"):
-        from .cohere import CohereForCausalLM
-
-        model = CohereForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16, device_map="auto"
-        )
-
-        response_template = "<|CHATBOT_TOKEN|>"
-    elif model_name.startswith("mistralai"):
+    if model_name.startswith("mistralai"):
         from .mistral import MistralForCausalLM
 
         model = MistralForCausalLM.from_pretrained(

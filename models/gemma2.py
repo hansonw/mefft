@@ -2,95 +2,24 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from liger_kernel.transformers.geglu import LigerGEGLUMLP
+from liger_kernel.transformers.rms_norm import LigerRMSNorm
 from liger_kernel.transformers.rope import liger_rotary_pos_emb
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.models.gemma2.modeling_gemma2 import (
     Gemma2Config,
+    Gemma2RotaryEmbedding,
     Gemma2ForCausalLM as OriginalGemma2ForCausalLM,
-    Gemma2MLP,
     Gemma2PreTrainedModel,
 )
 
 from .kernels import FusedLinearCrossEntropyFunction
-from .offload_checkpointer import OffloadCheckpointer
+from .utils import OffloadCheckpointer
 
 
-class Gemma2RMSNorm(nn.Module):
+class Gemma2RMSNorm(LigerRMSNorm):
     def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
-
-    def forward(self, x):
-        # Use the built-in torch.rms_norm kernel
-        return torch.rms_norm(
-            x.float(),
-            (x.shape[-1],),
-            weight=(1.0 + self.weight.float()),
-            eps=self.eps,
-        ).to(x.dtype)
-
-
-# class GeLUMul(torch.autograd.Function):
-#     """
-#     This function saves O(batch_size * seq_len * intermediate_size) memory by avoiding the intermediate gelu(gate).
-#     """
-#     @staticmethod
-#     def forward(ctx, gate, up):
-#         ctx.save_for_backward(gate, up)
-#         return nn.functional.gelu(gate, approximate="tanh") * up
-#     @staticmethod
-#     def backward(ctx, grad_output):
-#         gate, up = ctx.saved_tensors
-#         # TODO: write a custom Triton kernel for this
-#         return (
-#             # grad_gate
-#             torch.ops.aten.gelu_backward(grad_output * up, gate, approximate="tanh"),  # type: ignore
-#             # grad_up
-#             grad_output * nn.functional.gelu(gate, approximate="tanh"),
-#         )
-
-# class Gemma2MLP(nn.Module):
-#     def __init__(self, config):
-#         super().__init__()
-#         self.config = config
-#         self.hidden_size = config.hidden_size
-#         self.intermediate_size = config.intermediate_size
-#         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-#         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-#         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-#         assert (
-#             config.hidden_activation == "gelu_pytorch_tanh"
-#         ), "Only gelu_pytorch_tanh is supported"
-#     def forward(self, x):
-#         return self.down_proj(
-#             GeLUMul.apply(self.gate_proj(x), self.up_proj(x))
-#         )
-
-
-class Gemma2RotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, base: float = 10000):
-        super().__init__()
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim)
-        )
-        self.register_buffer("inv_freq", tensor=inv_freq, persistent=False)
-
-    @torch.no_grad()
-    def forward(self, x, position_ids):
-        inv_freq_expanded = (
-            self.inv_freq.to(x.device)[None, :, None]
-            .float()
-            .expand(position_ids.shape[0], -1, 1)
-        )
-        position_ids_expanded = position_ids[:, None, :].float()
-        # Force float32 since bfloat16 loses precision on long contexts
-        # See https://github.com/huggingface/transformers/pull/29285
-        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(
-            1, 2
-        )
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos(), emb.sin()
+        super().__init__(dim, eps=eps, offset=1.0, casting_mode="gemma")
 
 
 class Gemma2Attention(nn.Module):
@@ -194,7 +123,7 @@ class Gemma2DecoderLayer(nn.Module):
     def __init__(self, config: Gemma2Config, layer_idx: int):
         super().__init__()
         self.self_attn = Gemma2Attention(config=config, layer_idx=layer_idx)
-        self.mlp = Gemma2MLP(config)
+        self.mlp = LigerGEGLUMLP(config)
         self.input_layernorm = Gemma2RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -208,32 +137,31 @@ class Gemma2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+    def _self_attn(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        return x + self.post_attention_layernorm(
+            self.self_attn(self.input_layernorm(x), attention_mask, position_ids)
+        )
+
+    def _mlp(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.post_feedforward_layernorm(
+            self.mlp(self.pre_feedforward_layernorm(x))
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ):
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
+        hidden_states = OffloadCheckpointer.apply(
+            hidden_states, self._self_attn, attention_mask, position_ids
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return hidden_states
+        return OffloadCheckpointer.apply(hidden_states, self._mlp)
 
 
 class Gemma2Model(nn.Module):
@@ -267,9 +195,7 @@ class Gemma2Model(nn.Module):
         normalizer = torch.tensor(self.hidden_size**0.5, dtype=hidden_states.dtype)
         hidden_states = hidden_states * normalizer
         for decoder_layer in self.layers:
-            hidden_states = OffloadCheckpointer.apply(
-                hidden_states, decoder_layer, attention_mask, position_ids
-            )
+            hidden_states = decoder_layer(hidden_states, attention_mask, position_ids)
         return self.norm(hidden_states)
 
 

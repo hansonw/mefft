@@ -3,12 +3,14 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
+from liger_kernel.transformers.rms_norm import LigerRMSNorm
 from liger_kernel.transformers.rope import liger_rotary_pos_emb
 from transformers import MistralConfig
 from transformers.models.mistral.modeling_mistral import MistralRotaryEmbedding, MistralForCausalLM as OriginalMistralForCausalLM, MistralPreTrainedModel
 
 from .kernels import FusedLinearCrossEntropyFunction
-from .offload_checkpointer import OffloadCheckpointer
+from .utils import OffloadCheckpointer
 
 
 class Attention(nn.Module):
@@ -76,15 +78,26 @@ class Attention(nn.Module):
         return self.o_proj(attn_output)
 
 
-class DecoderLayer(nn.Module):
-    def __init__(self, config: MistralConfig):
+class MistralDecoderLayer(nn.Module):
+    def __init__(self, config: MistralConfig, layer_idx: int):
         super().__init__()
-        self.hidden_size = config.hidden_size
         self.self_attn = Attention(config)
-        from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
         self.mlp = LigerSwiGLUMLP(config)
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = LigerRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LigerRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def _self_attn(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        return x + self.post_attention_layernorm(
+            self.self_attn(self.input_layernorm(x), attention_mask, position_ids)[0]
+        )
+
+    def _mlp(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.mlp(x)
 
     def forward(
         self,
@@ -92,19 +105,16 @@ class DecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ):
-        output = x + self.self_attn(self.input_layernorm(x), attention_mask, position_ids)
-        return output + self.mlp(self.post_attention_layernorm(output))
+        output = OffloadCheckpointer.apply(x, self._self_attn, attention_mask, position_ids)
+        return OffloadCheckpointer.apply(output, self._mlp)
 
 
 class MistralModel(nn.Module):
     def __init__(self, config: MistralConfig):
         super().__init__()
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([DecoderLayer(config) for _ in range(config.num_hidden_layers)])
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+        self.layers = nn.ModuleList([MistralDecoderLayer(config, idx) for idx in range(config.num_hidden_layers)])
+        self.norm = LigerRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -117,9 +127,8 @@ class MistralModel(nn.Module):
 
         hidden_states = self.embed_tokens(input_ids)
         for decoder_layer in self.layers:
-            hidden_states = OffloadCheckpointer.apply(
+            hidden_states = decoder_layer(
                 hidden_states,
-                decoder_layer,
                 attention_mask,
                 position_ids,
             )
